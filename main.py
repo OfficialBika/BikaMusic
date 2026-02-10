@@ -410,11 +410,10 @@ async def cmd_queue(m: Message):
 # ----------------------------
 app = FastAPI()
 
-
-@app.get("/health")
-async def health():
+@app.api_route("/health", methods=["GET", "HEAD", "POST"])
+async def health_any():
+    # UptimeRobot / browser စသဖြင့် ဘယ် method နဲ့ခေါ်လည်း OK ပြန်မယ်
     return JSONResponse({"ok": True})
-
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
