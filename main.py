@@ -1,15 +1,16 @@
 # main.py
 # ==========================================
-# Group Voice Chat Music Bot (Render Free)
+# BikaMusic — Group Voice Chat Music Bot (Render Free)
+# - Python 3.11
 # - Webhook (FastAPI)
-# - /health endpoint (for UptimeRobot ping)
+# - /health endpoint (UptimeRobot)
 # - MongoDB ready (Motor)
-# - VC Streaming via Assistant User Account (Pyrogram + PyTgCalls)
+# - VC Streaming via Assistant User (Pyrogram + PyTgCalls)
 #
 # ENV required:
 #   BOT_TOKEN
-#   PUBLIC_URL                  e.g. https://your-service.onrender.com
-#   WEBHOOK_PATH                e.g. /telegram
+#   PUBLIC_URL                  e.g. https://bikamusic.onrender.com
+#   WEBHOOK_PATH                e.g. /telegram   (optional, default /telegram)
 #   WEBHOOK_SECRET              (optional but recommended)
 #   API_ID
 #   API_HASH
@@ -18,6 +19,7 @@
 #
 # Optional:
 #   ASSISTANT_USERNAME          default @BikaAssistant
+#   PORT                        default 10000 (Render supplies)
 # ==========================================
 
 import os
@@ -26,7 +28,7 @@ import asyncio
 import subprocess
 from typing import Dict, List, Optional
 
-import imageio_ffmpeg
+import imageio_ffmpeg  # ffmpeg binary helper (Render-friendly)
 
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -42,21 +44,7 @@ from aiogram.client.default import DefaultBotProperties
 
 from pyrogram import Client
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped
-
-
-# ----------------------------
-# ffmpeg (Render free-friendly)
-# ----------------------------
-try:
-    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-    ff_dir = os.path.dirname(FFMPEG_PATH)
-    path_env = os.environ.get("PATH", "")
-    if ff_dir not in path_env:
-        os.environ["PATH"] = ff_dir + os.pathsep + path_env
-except Exception:
-    # ffmpeg resolution failed -> yt-dlp will error later if really needed
-    pass
+from pytgcalls.types.input_stream import InputStream, AudioPiped
 
 
 # ----------------------------
@@ -65,7 +53,7 @@ except Exception:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # optional but recommended
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # optional
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
@@ -75,10 +63,13 @@ MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 ASSISTANT_USERNAME = os.getenv("ASSISTANT_USERNAME", "@BikaAssistant").strip()
-ASSISTANT_USERNAME = ASSISTANT_USERNAME if ASSISTANT_USERNAME.startswith("@") else f"@{ASSISTANT_USERNAME}"
+ASSISTANT_USERNAME = (
+    ASSISTANT_USERNAME if ASSISTANT_USERNAME.startswith("@") else f"@{ASSISTANT_USERNAME}"
+)
 ASSISTANT_LINK = f"https://t.me/{ASSISTANT_USERNAME[1:]}"
 
-missing = []
+# small sanity-check so Render မှာ log ကြည့်လို့ လွယ်အောင်
+missing: List[str] = []
 if not BOT_TOKEN:
     missing.append("BOT_TOKEN")
 if not PUBLIC_URL:
@@ -119,17 +110,18 @@ dp = Dispatcher()
 # ----------------------------
 assistant = Client(
     "assistant",
+    session_string=SESSION_STRING,
     api_id=API_ID,
     api_hash=API_HASH,
-    session_string=SESSION_STRING,
 )
+
 calls = PyTgCalls(assistant)
 
 ASSISTANT_ID: Optional[int] = None  # set on startup
 
 # In-memory queue (simple, fast)
-mem_queue: Dict[int, List[str]] = {}         # chat_id -> [file_path, ...]
-mem_now: Dict[int, Optional[str]] = {}       # chat_id -> current file path
+mem_queue: Dict[int, List[str]] = {}  # chat_id -> [file_path, ...]
+mem_now: Dict[int, Optional[str]] = {}  # chat_id -> current file path
 
 
 # ----------------------------
@@ -187,6 +179,20 @@ async def cleanup_file(path: str):
         pass
 
 
+async def ensure_peer(chat_id: int):
+    """
+    VERY IMPORTANT:
+    Pyrogram/PyTgCalls ကို group peer ကိုသိအောင် preload လုပ်ပေးတာ။
+    ဒီဟာ မလုပ်ရင် 'Peer id invalid' / 'ID not found' error ပေါက်ပြီး
+    service shutdown သွားနိုင်တယ်။
+    """
+    try:
+        await assistant.get_chat(chat_id)
+    except Exception:
+        # group မရှိရင် / missing permissions ဖြစ်ရင် ဒီနေရာမှာပဲ later handle
+        pass
+
+
 async def assistant_in_group(chat_id: int) -> bool:
     """
     Check if assistant user account is a member of the group.
@@ -195,6 +201,7 @@ async def assistant_in_group(chat_id: int) -> bool:
     if not ASSISTANT_ID:
         return False
     try:
+        await ensure_peer(chat_id)
         await assistant.get_chat_member(chat_id, ASSISTANT_ID)
         return True
     except Exception:
@@ -204,13 +211,16 @@ async def assistant_in_group(chat_id: int) -> bool:
 async def ensure_join_and_play(chat_id: int, file_path: str):
     """
     Join VC if not joined; otherwise change stream.
-    PyTgCalls 0.9.x uses AudioPiped directly.
+    Peer preload + safe join/change to avoid crash.
     """
-    stream = AudioPiped(file_path)
+    await ensure_peer(chat_id)
+
     try:
-        await calls.change_stream(chat_id, stream)
+        # already joined -> just change stream
+        await calls.change_stream(chat_id, InputStream(AudioPiped(file_path)))
     except Exception:
-        await calls.join_group_call(chat_id, stream)
+        # not joined yet -> join group call
+        await calls.join_group_call(chat_id, InputStream(AudioPiped(file_path)))
 
 
 async def play_next(chat_id: int):
@@ -237,7 +247,7 @@ async def play_next(chat_id: int):
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     txt = (
-        "🎵 <b>Group Voice Chat Music Bot</b>\n\n"
+        "🎵 <b>Bika Music — Group Voice Chat Music Bot</b>\n\n"
         "Commands:\n"
         "• <code>/setup</code> — setup guide\n"
         "• <code>/status</code> — စစ်ဆေးရန်\n"
@@ -247,8 +257,7 @@ async def cmd_start(m: Message):
         "• <code>/stop</code> — ရပ် + queue ဖျက်\n"
         "• <code>/queue</code> — စာရင်းကြည့်\n\n"
         "⚠️ Voice Chat ကို အရင်ဖွင့်ထားရမယ်\n"
-        f"ℹ️ Assistant: <a href=\"{ASSISTANT_LINK}\">{ASSISTANT_USERNAME}</a> "
-        "ကို group ထဲ add/invite လုပ်ထားပါ"
+        f"ℹ️ Assistant: <a href=\"{ASSISTANT_LINK}\">{ASSISTANT_USERNAME}</a> ကို group ထဲ add/invite လုပ်ထားပါ"
     )
     await m.reply(txt, disable_web_page_preview=True)
 
@@ -261,8 +270,7 @@ async def cmd_setup(m: Message):
     txt = (
         "🛠 <b>Setup (Group Voice Chat)</b>\n\n"
         "1) Group ထဲမှာ <b>Voice Chat</b> ကို ဖွင့်ပါ\n"
-        f"2) Assistant account ကို group ထဲ add/invite လုပ်ပါ: "
-        f"<a href=\"{ASSISTANT_LINK}\">{ASSISTANT_USERNAME}</a>\n"
+        f"2) Assistant account ကို group ထဲ add/invite လုပ်ပါ: <a href=\"{ASSISTANT_LINK}\">{ASSISTANT_USERNAME}</a>\n"
         "3) ပြီးရင် <code>/play songname</code> သုံးပါ\n\n"
         "📌 Note: Bot က user account ကို auto-add မလုပ်နိုင်ပါ (Telegram limitation)"
     )
@@ -302,9 +310,7 @@ async def cmd_play(m: Message):
 
     parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        return await m.reply(
-            "အသုံးပြုပုံ: <code>/play MusicName</code> သို့ <code>/play URL</code>"
-        )
+        return await m.reply("အသုံးပြုပုံ: <code>/play MusicName</code> သို့ <code>/play URL</code>")
 
     # assistant presence check BEFORE downloading (saves CPU/time)
     if not await assistant_in_group(m.chat.id):
@@ -412,8 +418,14 @@ app = FastAPI()
 
 
 @app.get("/health")
-async def health():
+async def health_get():
     return JSONResponse({"ok": True})
+
+
+@app.head("/health")
+async def health_head():
+    # UptimeRobot HEAD request တွေ 405 ပို့မလို့ simple 200 respond
+    return PlainTextResponse("", status_code=200)
 
 
 @app.post(WEBHOOK_PATH)
@@ -464,6 +476,8 @@ async def on_startup():
     except TelegramBadRequest:
         # ignore if already set or render reboots
         pass
+
+    print("main.py loaded successfully")
 
 
 @app.on_event("shutdown")
