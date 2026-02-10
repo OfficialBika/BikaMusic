@@ -1,14 +1,15 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
+
 aiogram==3.15.0
+
 pyrogram==2.0.106
 tgcrypto==1.2.5
 
-# ✅ correct package name for PyTgCalls
-py-tgcalls==2.2.11
+# Voice chat player (PyTgCalls)
+py-tgcalls==0.9.7
 
 motor==3.6.0
 yt-dlp==2025.1.26
 
-# ✅ gives you an ffmpeg binary without apt-get
-imageio-ffmpeg==0.6.0
+imageio-ffmpeg==0.4.9
