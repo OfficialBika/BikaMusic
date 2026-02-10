@@ -3,7 +3,7 @@ uvicorn[standard]==0.32.1
 aiogram==3.15.0
 pyrogram==2.0.106
 tgcrypto==1.2.5
-PyTgCalls==1.2.1
+PyTgCalls==1.2.0
 motor==3.6.0
 yt-dlp==2025.1.26
 imageio-ffmpeg==0.6.0
