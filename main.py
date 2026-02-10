@@ -6,25 +6,32 @@
 # - MongoDB ready (Motor)
 # - VC Streaming via Assistant User Account (Pyrogram + PyTgCalls)
 #
+# NOTE (Render Free):
+# - apt-get install ffmpeg may fail (read-only). We use imageio-ffmpeg instead.
+#
 # ENV required:
 #   BOT_TOKEN
-#   PUBLIC_URL                  e.g. https://your-service.onrender.com
-#   WEBHOOK_PATH                e.g. /telegram
-#   WEBHOOK_SECRET              (optional but recommended)
+#   PUBLIC_URL                  e.g. https://bikamusic.onrender.com
 #   API_ID
 #   API_HASH
 #   SESSION_STRING              (Pyrogram session for assistant user)
 #   MONGODB_URI
 #
 # Optional:
+#   WEBHOOK_PATH                default /telegram
+#   WEBHOOK_SECRET              optional but recommended
 #   ASSISTANT_USERNAME          default @BikaAssistant
+#   FFMPEG_PATH                 optional override
 # ==========================================
 
 import os
 import re
 import asyncio
 import subprocess
+import shutil
 from typing import Dict, List, Optional
+
+import imageio_ffmpeg
 
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
@@ -48,7 +55,7 @@ from pytgcalls.types.input_stream import InputStream, AudioPiped
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # optional but recommended
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # optional
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
@@ -61,10 +68,33 @@ ASSISTANT_USERNAME = os.getenv("ASSISTANT_USERNAME", "@BikaAssistant").strip()
 ASSISTANT_USERNAME = ASSISTANT_USERNAME if ASSISTANT_USERNAME.startswith("@") else f"@{ASSISTANT_USERNAME}"
 ASSISTANT_LINK = f"https://t.me/{ASSISTANT_USERNAME[1:]}"
 
-if not BOT_TOKEN or not PUBLIC_URL or not API_ID or not API_HASH or not SESSION_STRING or not MONGODB_URI:
-    raise RuntimeError(
-        "Missing env vars. Required: BOT_TOKEN, PUBLIC_URL, API_ID, API_HASH, SESSION_STRING, MONGODB_URI"
-    )
+# ffmpeg (Render free-friendly)
+# 1) use env override if set
+# 2) else use system ffmpeg if exists
+# 3) else use imageio-ffmpeg binary
+FFMPEG_PATH = (
+    os.getenv("FFMPEG_PATH", "").strip()
+    or (shutil.which("ffmpeg") or "")
+    or imageio_ffmpeg.get_ffmpeg_exe()
+)
+
+# Minimal validation
+missing = []
+if not BOT_TOKEN:
+    missing.append("BOT_TOKEN")
+if not PUBLIC_URL:
+    missing.append("PUBLIC_URL")
+if not API_ID:
+    missing.append("API_ID")
+if not API_HASH:
+    missing.append("API_HASH")
+if not SESSION_STRING:
+    missing.append("SESSION_STRING")
+if not MONGODB_URI:
+    missing.append("MONGODB_URI")
+
+if missing:
+    raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
 
 # ----------------------------
@@ -90,7 +120,10 @@ calls = PyTgCalls(assistant)
 
 ASSISTANT_ID: Optional[int] = None  # set on startup
 
-# In-memory queue (simple, fast)
+
+# ----------------------------
+# In-memory queue
+# ----------------------------
 mem_queue: Dict[int, List[str]] = {}         # chat_id -> [file_path, ...]
 mem_now: Dict[int, Optional[str]] = {}       # chat_id -> current file path
 
@@ -112,7 +145,7 @@ def safe_basename(path: Optional[str]) -> str:
 def ytdlp_to_mp3(query_or_url: str) -> str:
     """
     Download best audio and convert to mp3 into /tmp, return file path.
-    Requires: yt-dlp + ffmpeg installed.
+    Uses FFMPEG_PATH (imageio-ffmpeg) to avoid apt-get.
     """
     os.makedirs("/tmp/tg_music", exist_ok=True)
     outtmpl = "/tmp/tg_music/%(title).80s_%(id)s.%(ext)s"
@@ -123,6 +156,7 @@ def ytdlp_to_mp3(query_or_url: str) -> str:
 
     cmd = [
         "yt-dlp",
+        "--ffmpeg-location", FFMPEG_PATH,
         "-x", "--audio-format", "mp3",
         "--no-playlist",
         "-o", outtmpl,
@@ -230,6 +264,7 @@ async def cmd_status(m: Message):
         f"• Assistant in group: {'✅ Yes' if in_group else '❌ No'}\n"
         f"• Queue length: <b>{len(q)}</b>\n"
         f"• Now playing: <code>{safe_basename(now)}</code>\n"
+        f"• FFMPEG: <code>{FFMPEG_PATH}</code>\n"
     )
 
     if not in_group:
@@ -250,7 +285,7 @@ async def cmd_play(m: Message):
     if len(parts) < 2:
         return await m.reply("အသုံးပြုပုံ: <code>/play MusicName</code> သို့ <code>/play URL</code>")
 
-    # assistant presence check BEFORE downloading (saves CPU/time)
+    # assistant presence check BEFORE downloading
     if not await assistant_in_group(m.chat.id):
         return await m.reply(
             "❌ Assistant account မရှိသေးပါ။\n\n"
@@ -265,7 +300,7 @@ async def cmd_play(m: Message):
     try:
         file_path = await asyncio.to_thread(ytdlp_to_mp3, query)
     except Exception as e:
-        return await msg.edit_text(f"❌ မရပါ: <code>{str(e)[:180]}</code>")
+        return await msg.edit_text(f"❌ Download/Convert မရပါ: <code>{str(e)[:180]}</code>")
 
     mem_queue.setdefault(m.chat.id, []).append(file_path)
 
@@ -366,10 +401,9 @@ async def telegram_webhook(request: Request):
     data = await request.json()
 
     try:
-        update = Update.model_validate(data)  # aiogram v3 (pydantic)
+        update = Update.model_validate(data)  # aiogram v3
         await dp.feed_update(bot, update)
     except Exception:
-        # don't crash webhook
         pass
 
     return PlainTextResponse("ok")
@@ -381,6 +415,15 @@ async def telegram_webhook(request: Request):
 @app.on_event("startup")
 async def on_startup():
     global ASSISTANT_ID
+
+    # Ensure ffmpeg is discoverable by libraries that call "ffmpeg"
+    try:
+        ffdir = os.path.dirname(FFMPEG_PATH)
+        if ffdir:
+            os.environ["PATH"] = f"{ffdir}:{os.environ.get('PATH', '')}"
+        os.environ["FFMPEG"] = FFMPEG_PATH
+    except Exception:
+        pass
 
     # start assistant + calls
     await assistant.start()
@@ -401,7 +444,6 @@ async def on_startup():
             drop_pending_updates=True
         )
     except TelegramBadRequest:
-        # ignore if already set or render reboots
         pass
 
 @app.on_event("shutdown")
