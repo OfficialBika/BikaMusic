@@ -46,7 +46,6 @@ from aiogram.types import Message, Update
 
 from pyrogram import Client
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import InputStream, AudioPiped
 
 
 # ----------------------------
