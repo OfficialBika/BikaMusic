@@ -10,7 +10,7 @@
 #   BOT_TOKEN
 #   PUBLIC_URL                  e.g. https://your-service.onrender.com
 #   WEBHOOK_PATH                e.g. /telegram
-#   WEBHOOK_SECRET              (optional but recommended)
+#   WEBHOOK_SECRET              (optional)
 #   API_ID
 #   API_HASH
 #   SESSION_STRING              (Pyrogram session for assistant user)
@@ -27,10 +27,8 @@ import subprocess
 from typing import Dict, List, Optional
 
 import imageio_ffmpeg
-
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
-
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from aiogram import Bot, Dispatcher
@@ -42,21 +40,18 @@ from aiogram.client.default import DefaultBotProperties
 
 from pyrogram import Client
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped
+from pytgcalls.types.input_stream import InputStream, AudioPiped
 
 
 # ----------------------------
-# ffmpeg (Render free-friendly)
+# FFmpeg (Render free tier friendly)
 # ----------------------------
 try:
-    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-    ff_dir = os.path.dirname(FFMPEG_PATH)
-    path_env = os.environ.get("PATH", "")
-    if ff_dir not in path_env:
-        os.environ["PATH"] = ff_dir + os.pathsep + path_env
-except Exception:
-    # ffmpeg resolution failed -> yt-dlp will error later if really needed
-    pass
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    ffmpeg_dir = os.path.dirname(ffmpeg_path)
+    os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+except Exception as e:
+    print("FFmpeg auto-setup failed, yt-dlp may fail:", e)
 
 
 # ----------------------------
@@ -64,8 +59,12 @@ except Exception:
 # ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # optional but recommended
+if not WEBHOOK_PATH.startswith("/"):
+    WEBHOOK_PATH = "/" + WEBHOOK_PATH
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # optional
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
@@ -75,10 +74,12 @@ MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
 ASSISTANT_USERNAME = os.getenv("ASSISTANT_USERNAME", "@BikaAssistant").strip()
-ASSISTANT_USERNAME = ASSISTANT_USERNAME if ASSISTANT_USERNAME.startswith("@") else f"@{ASSISTANT_USERNAME}"
+ASSISTANT_USERNAME = (
+    ASSISTANT_USERNAME if ASSISTANT_USERNAME.startswith("@") else f"@{ASSISTANT_USERNAME}"
+)
 ASSISTANT_LINK = f"https://t.me/{ASSISTANT_USERNAME[1:]}"
 
-missing = []
+missing: List[str] = []
 if not BOT_TOKEN:
     missing.append("BOT_TOKEN")
 if not PUBLIC_URL:
@@ -97,11 +98,11 @@ if missing:
 
 
 # ----------------------------
-# DB (ready for future settings)
+# DB (future settings)
 # ----------------------------
 mongo = AsyncIOMotorClient(MONGODB_URI)
 db = mongo["telegram_music_bot"]
-col_settings = db["settings"]  # reserved (dj mode, volume, etc.)
+col_settings = db["settings"]  # reserved for dj mode, volume, etc.
 
 
 # ----------------------------
@@ -119,15 +120,15 @@ dp = Dispatcher()
 # ----------------------------
 assistant = Client(
     "assistant",
+    session_string=SESSION_STRING,
     api_id=API_ID,
     api_hash=API_HASH,
-    session_string=SESSION_STRING,
 )
 calls = PyTgCalls(assistant)
 
 ASSISTANT_ID: Optional[int] = None  # set on startup
 
-# In-memory queue (simple, fast)
+# In-memory queue
 mem_queue: Dict[int, List[str]] = {}         # chat_id -> [file_path, ...]
 mem_now: Dict[int, Optional[str]] = {}       # chat_id -> current file path
 
@@ -152,7 +153,8 @@ def safe_basename(path: Optional[str]) -> str:
 def ytdlp_to_mp3(query_or_url: str) -> str:
     """
     Download best audio and convert to mp3 into /tmp, return file path.
-    Requires: yt-dlp + ffmpeg installed.
+    Uses yt-dlp + ffmpeg (via imageio-ffmpeg on Render).
+    This runs in a thread (asyncio.to_thread) to avoid blocking the event loop.
     """
     os.makedirs("/tmp/tg_music", exist_ok=True)
     outtmpl = "/tmp/tg_music/%(title).80s_%(id)s.%(ext)s"
@@ -204,9 +206,8 @@ async def assistant_in_group(chat_id: int) -> bool:
 async def ensure_join_and_play(chat_id: int, file_path: str):
     """
     Join VC if not joined; otherwise change stream.
-    PyTgCalls 0.9.x uses AudioPiped directly.
     """
-    stream = AudioPiped(file_path)
+    stream = InputStream(AudioPiped(file_path))
     try:
         await calls.change_stream(chat_id, stream)
     except Exception:
@@ -247,10 +248,12 @@ async def cmd_start(m: Message):
         "• <code>/stop</code> — ရပ် + queue ဖျက်\n"
         "• <code>/queue</code> — စာရင်းကြည့်\n\n"
         "⚠️ Voice Chat ကို အရင်ဖွင့်ထားရမယ်\n"
-        f"ℹ️ Assistant: <a href=\"{ASSISTANT_LINK}\">{ASSISTANT_USERNAME}</a> "
-        "ကို group ထဲ add/invite လုပ်ထားပါ"
+        f"ℹ️ Assistant: <a href=\"{ASSISTANT_LINK}\">{ASSISTANT_USERNAME}</a> ကို group ထဲ add/invite လုပ်ထားပါ"
     )
-    await m.reply(txt, disable_web_page_preview=True)
+    try:
+        await m.reply(txt, disable_web_page_preview=True)
+    except Exception as e:
+        print("Error in /start:", e)
 
 
 @dp.message(Command("setup"))
@@ -410,17 +413,25 @@ async def cmd_queue(m: Message):
 # ----------------------------
 app = FastAPI()
 
-@app.api_route("/health", methods=["GET", "HEAD", "POST"])
-async def health_any():
-    # UptimeRobot / browser စသဖြင့် ဘယ် method နဲ့ခေါ်လည်း OK ပြန်မယ်
+
+@app.get("/")
+async def root():
+    # Simple root endpoint for debugging
     return JSONResponse({"ok": True})
+
+
+@app.get("/health")
+async def health():
+    return JSONResponse({"ok": True})
+
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    # Optional secret header validation (recommended)
+    # Optional secret header validation
     if WEBHOOK_SECRET:
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if secret != WEBHOOK_SECRET:
+            # Wrong secret -> ignore
             return PlainTextResponse("forbidden", status_code=403)
 
     data = await request.json()
@@ -428,9 +439,9 @@ async def telegram_webhook(request: Request):
     try:
         update = Update.model_validate(data)  # aiogram v3 (pydantic)
         await dp.feed_update(bot, update)
-    except Exception:
-        # don't crash webhook
-        pass
+    except Exception as e:
+        # Don't crash webhook on any error
+        print("Update handling error:", e)
 
     return PlainTextResponse("ok")
 
@@ -442,31 +453,37 @@ async def telegram_webhook(request: Request):
 async def on_startup():
     global ASSISTANT_ID
 
-    # start assistant + calls
+    print("Starting assistant userbot…")
     await assistant.start()
     try:
         me = await assistant.get_me()
         ASSISTANT_ID = me.id
-    except Exception:
+        print(f"Assistant started as {me.id} ({getattr(me, 'username', '')})")
+    except Exception as e:
         ASSISTANT_ID = None
+        print("Failed to get assistant me():", e)
 
+    print("Starting PyTgCalls…")
     await calls.start()
 
-    # set webhook
     webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
+    print(f"Setting webhook to: {webhook_url}")
     try:
         await bot.set_webhook(
             url=webhook_url,
             secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
             drop_pending_updates=True,
         )
-    except TelegramBadRequest:
-        # ignore if already set or render reboots
-        pass
+    except TelegramBadRequest as e:
+        # ignore if already set, etc.
+        print("set_webhook TelegramBadRequest:", e)
+    except Exception as e:
+        print("set_webhook error:", e)
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    print("Shutting down…")
     # cleanup local tmp files best-effort
     try:
         for chat_id, items in list(mem_queue.items()):
@@ -496,3 +513,6 @@ async def on_shutdown():
         await bot.session.close()
     except Exception:
         pass
+
+
+print("main.py loaded successfully")
