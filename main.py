@@ -365,10 +365,10 @@ async def cmd_queue(m: Message):
 # -------------------------------------------------
 app = FastAPI()
 
-@app.get("/health")
-async def health():
+@app.api_route("/health", methods=["GET", "HEAD"])
+async def health(request: Request):
     return JSONResponse({"ok": True})
-
+    
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
     # Secret token check (optional)
