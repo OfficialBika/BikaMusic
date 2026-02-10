@@ -1,34 +1,14 @@
-# main.py
-# ==========================================
-# Group Voice Chat Music Bot (Render Free)
-# - Webhook (FastAPI)
-# - /health endpoint (for UptimeRobot ping)
-# - MongoDB ready (Motor)
-# - VC Streaming via Assistant User Account (Pyrogram + PyTgCalls)
-#
-# ENV required:
-#   BOT_TOKEN
-#   PUBLIC_URL                  e.g. https://your-service.onrender.com
-#   WEBHOOK_PATH                e.g. /telegram
-#   WEBHOOK_SECRET              (optional)
-#   API_ID
-#   API_HASH
-#   SESSION_STRING              (Pyrogram session for assistant user)
-#   MONGODB_URI
-#
-# Optional:
-#   ASSISTANT_USERNAME          default @BikaAssistant
-# ==========================================
-
 import os
 import re
 import asyncio
 import subprocess
+import logging
 from typing import Dict, List, Optional
 
 import imageio_ffmpeg
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
+
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from aiogram import Bot, Dispatcher
@@ -42,29 +22,22 @@ from pyrogram import Client
 from pytgcalls import PyTgCalls
 from pytgcalls.types.input_stream import InputStream, AudioPiped
 
+# -------------------------------------------------
+# Logging
+# -------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s:%(name)s:%(message)s",
+)
+logger = logging.getLogger("bikamusic")
 
-# ----------------------------
-# FFmpeg (Render free tier friendly)
-# ----------------------------
-try:
-    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-    ffmpeg_dir = os.path.dirname(ffmpeg_path)
-    os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-except Exception as e:
-    print("FFmpeg auto-setup failed, yt-dlp may fail:", e)
-
-
-# ----------------------------
+# -------------------------------------------------
 # ENV
-# ----------------------------
+# -------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
-
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram").strip()
-if not WEBHOOK_PATH.startswith("/"):
-    WEBHOOK_PATH = "/" + WEBHOOK_PATH
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()  # optional
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
@@ -75,11 +48,13 @@ PORT = int(os.getenv("PORT", "10000"))
 
 ASSISTANT_USERNAME = os.getenv("ASSISTANT_USERNAME", "@BikaAssistant").strip()
 ASSISTANT_USERNAME = (
-    ASSISTANT_USERNAME if ASSISTANT_USERNAME.startswith("@") else f"@{ASSISTANT_USERNAME}"
+    ASSISTANT_USERNAME
+    if ASSISTANT_USERNAME.startswith("@")
+    else f"@{ASSISTANT_USERNAME}"
 )
 ASSISTANT_LINK = f"https://t.me/{ASSISTANT_USERNAME[1:]}"
 
-missing: List[str] = []
+missing = []
 if not BOT_TOKEN:
     missing.append("BOT_TOKEN")
 if not PUBLIC_URL:
@@ -96,65 +71,60 @@ if not MONGODB_URI:
 if missing:
     raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
+# -------------------------------------------------
+# ffmpeg (Render free-friendly)
+# -------------------------------------------------
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+os.environ["PATH"] = os.path.dirname(FFMPEG_PATH) + os.pathsep + os.environ.get("PATH", "")
 
-# ----------------------------
-# DB (future settings)
-# ----------------------------
+# -------------------------------------------------
+# DB (future use)
+# -------------------------------------------------
 mongo = AsyncIOMotorClient(MONGODB_URI)
 db = mongo["telegram_music_bot"]
-col_settings = db["settings"]  # reserved for dj mode, volume, etc.
+col_settings = db["settings"]
 
-
-# ----------------------------
-# Telegram Bot (Webhook) via aiogram
-# ----------------------------
+# -------------------------------------------------
+# Telegram Bot (webhook) via aiogram
+# -------------------------------------------------
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
 
-
-# ----------------------------
-# Assistant (userbot) + PyTgCalls for VC streaming
-# ----------------------------
-assistant = Client(
-    "assistant",
-    session_string=SESSION_STRING,
-    api_id=API_ID,
-    api_hash=API_HASH,
-)
+# -------------------------------------------------
+# Assistant (userbot) + PyTgCalls
+# -------------------------------------------------
+assistant = Client("assistant", session_string=SESSION_STRING, api_id=API_ID, api_hash=API_HASH)
 calls = PyTgCalls(assistant)
 
-ASSISTANT_ID: Optional[int] = None  # set on startup
+ASSISTANT_ID: Optional[int] = None
 
+# -------------------------------------------------
 # In-memory queue
-mem_queue: Dict[int, List[str]] = {}         # chat_id -> [file_path, ...]
-mem_now: Dict[int, Optional[str]] = {}       # chat_id -> current file path
+# -------------------------------------------------
+mem_queue: Dict[int, List[str]] = {}      # chat_id -> [file_path, ...]
+mem_now: Dict[int, Optional[str]] = {}    # chat_id -> current file_path
 
-
-# ----------------------------
+# -------------------------------------------------
 # Helpers
-# ----------------------------
+# -------------------------------------------------
 def normalize_music_query(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
-
 def is_url(s: str) -> bool:
     return s.startswith("http://") or s.startswith("https://")
-
 
 def safe_basename(path: Optional[str]) -> str:
     if not path:
         return "—"
     return os.path.basename(path).replace("<", "").replace(">", "")
 
-
 def ytdlp_to_mp3(query_or_url: str) -> str:
     """
-    Download best audio and convert to mp3 into /tmp, return file path.
-    Uses yt-dlp + ffmpeg (via imageio-ffmpeg on Render).
-    This runs in a thread (asyncio.to_thread) to avoid blocking the event loop.
+    Download (or search+download) audio with yt-dlp and return mp3 file path.
+    Run in background thread via asyncio.to_thread because it is blocking.
     """
     os.makedirs("/tmp/tg_music", exist_ok=True)
     outtmpl = "/tmp/tg_music/%(title).80s_%(id)s.%(ext)s"
@@ -165,22 +135,23 @@ def ytdlp_to_mp3(query_or_url: str) -> str:
 
     cmd = [
         "yt-dlp",
-        "-x",
-        "--audio-format",
-        "mp3",
+        "-x", "--audio-format", "mp3",
         "--no-playlist",
-        "-o",
-        outtmpl,
+        "-o", outtmpl,
         target,
     ]
+    logger.info("Running yt-dlp: %s", " ".join(cmd))
     subprocess.check_call(cmd)
 
     files = [f for f in os.listdir("/tmp/tg_music") if f.endswith(".mp3")]
-    files.sort(key=lambda x: os.path.getmtime(os.path.join("/tmp/tg_music", x)), reverse=True)
+    files.sort(
+        key=lambda x: os.path.getmtime(os.path.join("/tmp/tg_music", x)),
+        reverse=True,
+    )
     if not files:
-        raise RuntimeError("No mp3 produced")
-    return os.path.join("/tmp/tg_music", files[0])
+        raise RuntimeError("No mp3 produced by yt-dlp")
 
+    return os.path.join("/tmp/tg_music", files[0])
 
 async def cleanup_file(path: str):
     try:
@@ -188,36 +159,27 @@ async def cleanup_file(path: str):
     except Exception:
         pass
 
-
 async def assistant_in_group(chat_id: int) -> bool:
-    """
-    Check if assistant user account is a member of the group.
-    """
+    """Check assistant already in group or not."""
     global ASSISTANT_ID
     if not ASSISTANT_ID:
         return False
+
     try:
         await assistant.get_chat_member(chat_id, ASSISTANT_ID)
         return True
     except Exception:
         return False
 
-
 async def ensure_join_and_play(chat_id: int, file_path: str):
-    """
-    Join VC if not joined; otherwise change stream.
-    """
-    stream = InputStream(AudioPiped(file_path))
+    """Join VC (if needed) and start playing."""
     try:
-        await calls.change_stream(chat_id, stream)
+        await calls.change_stream(chat_id, InputStream(AudioPiped(file_path)))
     except Exception:
-        await calls.join_group_call(chat_id, stream)
-
+        await calls.join_group_call(chat_id, InputStream(AudioPiped(file_path)))
 
 async def play_next(chat_id: int):
-    """
-    Play first item in queue; if empty -> leave VC.
-    """
+    """Play next item from queue (or leave VC if empty)."""
     q = mem_queue.get(chat_id, [])
     if not q:
         mem_now[chat_id] = None
@@ -231,10 +193,9 @@ async def play_next(chat_id: int):
     mem_now[chat_id] = file_path
     await ensure_join_and_play(chat_id, file_path)
 
-
-# ----------------------------
+# -------------------------------------------------
 # Commands
-# ----------------------------
+# -------------------------------------------------
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     txt = (
@@ -250,11 +211,7 @@ async def cmd_start(m: Message):
         "⚠️ Voice Chat ကို အရင်ဖွင့်ထားရမယ်\n"
         f"ℹ️ Assistant: <a href=\"{ASSISTANT_LINK}\">{ASSISTANT_USERNAME}</a> ကို group ထဲ add/invite လုပ်ထားပါ"
     )
-    try:
-        await m.reply(txt, disable_web_page_preview=True)
-    except Exception as e:
-        print("Error in /start:", e)
-
+    await m.reply(txt, disable_web_page_preview=True)
 
 @dp.message(Command("setup"))
 async def cmd_setup(m: Message):
@@ -264,13 +221,11 @@ async def cmd_setup(m: Message):
     txt = (
         "🛠 <b>Setup (Group Voice Chat)</b>\n\n"
         "1) Group ထဲမှာ <b>Voice Chat</b> ကို ဖွင့်ပါ\n"
-        f"2) Assistant account ကို group ထဲ add/invite လုပ်ပါ: "
-        f"<a href=\"{ASSISTANT_LINK}\">{ASSISTANT_USERNAME}</a>\n"
+        f"2) Assistant account ကို group ထဲ add/invite လုပ်ပါ: <a href=\"{ASSISTANT_LINK}\">{ASSISTANT_USERNAME}</a>\n"
         "3) ပြီးရင် <code>/play songname</code> သုံးပါ\n\n"
         "📌 Note: Bot က user account ကို auto-add မလုပ်နိုင်ပါ (Telegram limitation)"
     )
     await m.reply(txt, disable_web_page_preview=True)
-
 
 @dp.message(Command("status"))
 async def cmd_status(m: Message):
@@ -297,7 +252,6 @@ async def cmd_status(m: Message):
 
     await m.reply(txt, disable_web_page_preview=True)
 
-
 @dp.message(Command("play"))
 async def cmd_play(m: Message):
     if not m.chat or m.chat.type not in ("group", "supergroup"):
@@ -309,7 +263,6 @@ async def cmd_play(m: Message):
             "အသုံးပြုပုံ: <code>/play MusicName</code> သို့ <code>/play URL</code>"
         )
 
-    # assistant presence check BEFORE downloading (saves CPU/time)
     if not await assistant_in_group(m.chat.id):
         return await m.reply(
             "❌ Assistant account မရှိသေးပါ။\n\n"
@@ -324,6 +277,7 @@ async def cmd_play(m: Message):
     try:
         file_path = await asyncio.to_thread(ytdlp_to_mp3, query)
     except Exception as e:
+        logger.exception("yt-dlp error")
         return await msg.edit_text(f"❌ မရပါ: <code>{str(e)[:180]}</code>")
 
     mem_queue.setdefault(m.chat.id, []).append(file_path)
@@ -333,6 +287,7 @@ async def cmd_play(m: Message):
             await play_next(m.chat.id)
             await msg.edit_text(f"▶️ Playing: <code>{safe_basename(file_path)}</code>")
         except Exception as e:
+            logger.exception("VC play error")
             await msg.edit_text(
                 "⚠️ VC join/play မရပါ\n"
                 f"• Error: <code>{str(e)[:180]}</code>\n\n"
@@ -343,7 +298,6 @@ async def cmd_play(m: Message):
             )
     else:
         await msg.edit_text(f"➕ Queued: <code>{safe_basename(file_path)}</code>")
-
 
 @dp.message(Command("skip"))
 async def cmd_skip(m: Message):
@@ -369,8 +323,8 @@ async def cmd_skip(m: Message):
         await play_next(m.chat.id)
         await m.reply("⏭ Skipped")
     except Exception as e:
+        logger.exception("Next play error")
         await m.reply(f"⚠️ Next play မရ: <code>{str(e)[:180]}</code>")
-
 
 @dp.message(Command("stop"))
 async def cmd_stop(m: Message):
@@ -391,7 +345,6 @@ async def cmd_stop(m: Message):
 
     await m.reply("⏹ Stopped & cleared queue")
 
-
 @dp.message(Command("queue"))
 async def cmd_queue(m: Message):
     if not m.chat or m.chat.type not in ("group", "supergroup"):
@@ -407,84 +360,69 @@ async def cmd_queue(m: Message):
         lines.append(f"{prefix}{i}. <code>{safe_basename(p)}</code>")
     await m.reply("\n".join(lines))
 
-
-# ----------------------------
-# FastAPI (Webhook + Health)
-# ----------------------------
+# -------------------------------------------------
+# FastAPI app
+# -------------------------------------------------
 app = FastAPI()
-
-
-@app.get("/")
-async def root():
-    # Simple root endpoint for debugging
-    return JSONResponse({"ok": True})
-
 
 @app.get("/health")
 async def health():
     return JSONResponse({"ok": True})
 
-
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    # Optional secret header validation
+    # Secret token check (optional)
     if WEBHOOK_SECRET:
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if secret != WEBHOOK_SECRET:
-            # Wrong secret -> ignore
+            logger.warning("Invalid secret token from Telegram: %s", secret)
             return PlainTextResponse("forbidden", status_code=403)
 
     data = await request.json()
+    logger.info("Incoming update: %s", data)
 
     try:
-        update = Update.model_validate(data)  # aiogram v3 (pydantic)
+        update = Update.model_validate(data)
         await dp.feed_update(bot, update)
-    except Exception as e:
-        # Don't crash webhook on any error
-        print("Update handling error:", e)
+    except Exception:
+        logger.exception("Error while handling update")
 
     return PlainTextResponse("ok")
 
-
-# ----------------------------
+# -------------------------------------------------
 # Startup / Shutdown
-# ----------------------------
+# -------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
     global ASSISTANT_ID
 
-    print("Starting assistant userbot…")
+    logger.info("Starting assistant userbot…")
     await assistant.start()
     try:
         me = await assistant.get_me()
         ASSISTANT_ID = me.id
-        print(f"Assistant started as {me.id} ({getattr(me, 'username', '')})")
-    except Exception as e:
+        logger.info("Assistant started as %s (%s)", me.first_name, me.id)
+    except Exception:
         ASSISTANT_ID = None
-        print("Failed to get assistant me():", e)
+        logger.exception("Failed to get assistant info")
 
-    print("Starting PyTgCalls…")
+    logger.info("Starting PyTgCalls…")
     await calls.start()
 
     webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
-    print(f"Setting webhook to: {webhook_url}")
     try:
         await bot.set_webhook(
             url=webhook_url,
-            secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+            secret_token=WEBHOOK_SECRET or None,
             drop_pending_updates=True,
         )
-    except TelegramBadRequest as e:
-        # ignore if already set, etc.
-        print("set_webhook TelegramBadRequest:", e)
-    except Exception as e:
-        print("set_webhook error:", e)
-
+        logger.info("Webhook set to %s", webhook_url)
+    except TelegramBadRequest:
+        logger.exception("Failed to set webhook")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    print("Shutting down…")
-    # cleanup local tmp files best-effort
+    # Clean tmp files
     try:
         for chat_id, items in list(mem_queue.items()):
             for f in items:
@@ -513,6 +451,3 @@ async def on_shutdown():
         await bot.session.close()
     except Exception:
         pass
-
-
-print("main.py loaded successfully")
