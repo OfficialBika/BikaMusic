@@ -4,7 +4,6 @@ The public search/playlist/download methods intentionally retain their legacy
 signatures so existing play, queue and voice-call handlers remain compatible.
 """
 import asyncio
-import logging
 import os
 import random
 import re
@@ -139,9 +138,7 @@ class YouTube:
             if not info:
                 return None
             duration = int(info.get("duration") or 0)
-            duration_text = utils.format_eta(duration) if hasattr(utils, "format_eta") else (
-                f"{duration // 60}:{duration % 60:02d}" if duration else "00:00"
-            )
+            duration_text = utils.format_eta(duration) if duration else "00:00"
             webpage_url = info.get("webpage_url") or info.get("original_url")
             video_id = info.get("id")
             if not video_id and webpage_url:
@@ -253,7 +250,14 @@ class YouTube:
             prepared = Path(ydl.prepare_filename(info))
             if prepared.is_file():
                 return str(prepared)
-        candidates = sorted(self.download_dir.glob(f"{video_id}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        candidates = sorted(
+            (
+                path for path in self.download_dir.glob(f"{video_id}.*")
+                if path.is_file() and path.stat().st_size > 0
+            ),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
         if candidates:
             return str(candidates[0])
         raise FileNotFoundError(f"yt-dlp did not produce a media file for {video_id}")
@@ -262,9 +266,12 @@ class YouTube:
         video_id = str(video_id or "").strip()
         if not video_id:
             return None
-        candidates = list(self.download_dir.glob(f"{video_id}.*"))
+        candidates = [
+            path for path in self.download_dir.glob(f"{video_id}.*")
+            if path.is_file() and path.stat().st_size > 0
+        ]
         if candidates:
-            return str(max(candidates, key=lambda p: p.stat().st_mtime))
+            return str(max(candidates, key=lambda path: path.stat().st_mtime))
         cookie_file = self.load_cookies()
         try:
             return await asyncio.to_thread(self._download_sync, video_id, video, cookie_file)
