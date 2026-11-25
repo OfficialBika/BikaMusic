@@ -29,15 +29,15 @@ class YouTube:
         self.download_dir.mkdir(parents=True, exist_ok=True)
 
         self.youtube_pattern = re.compile(
-            r"^(?:https?://)?(?:(?:www|m|music)\\.)?"
-            r"(?:youtube\\.com/(?:watch\\?v=|shorts/|playlist\\?list=)|youtu\\.be/)"
-            r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)(?:[&?][^\\s]*)?$",
+            r"^(?:https?://)?(?:(?:www|m|music)\.)?"
+            r"(?:youtube\.com/(?:watch\?v=|shorts/|playlist\?list=)|youtu\.be/)"
+            r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)(?:[&?][^\s]*)?$",
             re.IGNORECASE,
         )
         self.invalid_pattern = re.compile(
-            r"^https?://(?:(?:www|m|music)\\.)?(?:youtube\\.com|youtu\\.be)"
-            r"(?!/(?:watch\\?v=[A-Za-z0-9_-]{11}|shorts/[A-Za-z0-9_-]{11}"
-            r"|playlist\\?list=PL[A-Za-z0-9_-]+|[A-Za-z0-9_-]{11}))\\S*",
+            r"^https?://(?:(?:www|m|music)\.)?(?:youtube\.com|youtu\.be)"
+            r"(?!/(?:watch\?v=[A-Za-z0-9_-]{11}|shorts/[A-Za-z0-9_-]{11}"
+            r"|playlist\?list=PL[A-Za-z0-9_-]+|[A-Za-z0-9_-]{11}))\\S*",
             re.IGNORECASE,
         )
 
