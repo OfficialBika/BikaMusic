@@ -1,12 +1,18 @@
+"""V4-style yt-dlp YouTube resolver adapted to BikaMusic's Track API.
+
+The public search/playlist/download methods intentionally retain their legacy
+signatures so existing play, queue and voice-call handlers remain compatible.
+"""
 import asyncio
+import logging
 import os
 import random
 import re
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 import yt_dlp
-from py_yt import Playlist, VideosSearch
 
 from bot import logger
 from bot.helpers import Track, utils
@@ -19,159 +25,249 @@ class YouTube:
         self.cookies_loaded = False
         self.cookie_folder = "bot/cookies"
         self.cookie_warned = False
+        self.download_dir = Path("downloads")
+        self.download_dir.mkdir(parents=True, exist_ok=True)
 
         self.youtube_pattern = re.compile(
-            r"(https?://)?(www\.|m\.|music\.)?"
-            r"(youtube\.com/(watch\?v=|shorts/|playlist\?list=)|youtu\.be/)"
-            r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)([&?][^\s]*)?"
+            r"^(?:https?://)?(?:(?:www|m|music)\\.)?"
+            r"(?:youtube\\.com/(?:watch\\?v=|shorts/|playlist\\?list=)|youtu\\.be/)"
+            r"([A-Za-z0-9_-]{11}|PL[A-Za-z0-9_-]+)(?:[&?][^\\s]*)?$",
+            re.IGNORECASE,
         )
         self.invalid_pattern = re.compile(
-            r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)"
-            r"(?!/(watch\?v=[A-Za-z0-9_-]{11}|shorts/[A-Za-z0-9_-]{11}"
-            r"|playlist\?list=PL[A-Za-z0-9_-]+|[A-Za-z0-9_-]{11}))\S*"
+            r"^https?://(?:(?:www|m|music)\\.)?(?:youtube\\.com|youtu\\.be)"
+            r"(?!/(?:watch\\?v=[A-Za-z0-9_-]{11}|shorts/[A-Za-z0-9_-]{11}"
+            r"|playlist\\?list=PL[A-Za-z0-9_-]+|[A-Za-z0-9_-]{11}))\\S*",
+            re.IGNORECASE,
         )
 
     def load_cookies(self):
         if not self.cookies_loaded:
             if os.path.isdir(self.cookie_folder):
-                for file_name in os.listdir(self.cookie_folder):
-                    if file_name.endswith(".txt"):
-                        self.cookie_files.append(f"{self.cookie_folder}/{file_name}")
+                self.cookie_files = [
+                    str(Path(self.cookie_folder) / name)
+                    for name in os.listdir(self.cookie_folder)
+                    if name.endswith(".txt")
+                ]
             self.cookies_loaded = True
 
         if not self.cookie_files:
             if not self.cookie_warned:
                 self.cookie_warned = True
-                logger.warning("Cookies are missing; downloads might fail.")
+                logger.warning("No YouTube cookies configured; trying without cookies.")
             return None
-
         return random.choice(self.cookie_files)
 
     async def save_cookies(self, cookie_urls: list[str]) -> None:
         logger.info("Saving cookies from urls...")
-
-        async with aiohttp.ClientSession() as session:
+        Path(self.cookie_folder).mkdir(parents=True, exist_ok=True)
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             for source_url in cookie_urls:
-                file_name = source_url.split("/")[-1]
+                file_name = source_url.rstrip("/").split("/")[-1]
+                if not file_name:
+                    continue
                 raw_url = "https://batbin.me/raw/" + file_name
-
                 async with session.get(raw_url) as response:
                     response.raise_for_status()
-                    with open(f"{self.cookie_folder}/{file_name}.txt", "wb") as fw:
-                        fw.write(await response.read())
-
+                    destination = Path(self.cookie_folder) / f"{file_name}.txt"
+                    destination.write_bytes(await response.read())
+        self.cookie_files = []
+        self.cookies_loaded = False
         logger.info("Cookies saved in %s.", self.cookie_folder)
 
     def valid(self, url: str) -> bool:
-        return bool(re.match(self.youtube_pattern, url))
+        return bool(self.youtube_pattern.match(url or ""))
 
     def invalid(self, url: str) -> bool:
-        return bool(re.match(self.invalid_pattern, url))
+        return bool(self.invalid_pattern.match(url or ""))
 
-    async def search(
-        self,
-        query: str,
-        msg_id: int,
-        video: bool = False,
-    ) -> Track | None:
+    @staticmethod
+    def _normalize_query(query: str) -> str:
+        value = (query or "").strip()
+        if not value:
+            raise ValueError("Please provide a song name or YouTube URL.")
+        if value.lower().startswith((
+            "youtube.com/", "www.youtube.com/", "m.youtube.com/",
+            "music.youtube.com/", "youtu.be/", "www.youtu.be/",
+        )):
+            value = "https://" + value
+        parsed = urlparse(value)
+        if parsed.scheme and parsed.scheme not in {"http", "https"}:
+            raise ValueError("Only HTTP(S) media URLs are supported.")
+        if parsed.netloc:
+            host = (parsed.hostname or "").lower().rstrip(".")
+            allowed = (
+                host == "youtube.com" or host.endswith(".youtube.com")
+                or host == "youtu.be" or host.endswith(".youtu.be")
+            )
+            if not allowed:
+                raise ValueError("Only YouTube URLs are supported.")
+        return value
+
+    def _base_options(self, *, playlist: bool = False) -> dict:
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": not playlist,
+            "socket_timeout": 20,
+            "retries": 3,
+            "extractor_retries": 2,
+        }
+        cookie_file = self.load_cookies()
+        if cookie_file and Path(cookie_file).is_file():
+            options["cookiefile"] = cookie_file
+        return options
+
+    @staticmethod
+    def _extract_info(query: str, options: dict) -> dict:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            if query.startswith(("http://", "https://")):
+                return ydl.extract_info(query, download=False)
+            result = ydl.extract_info(f"ytsearch1:{query}", download=False)
+            entries = (result or {}).get("entries") or []
+            if not entries:
+                return {}
+            return entries[0]
+
+    async def search(self, query: str, msg_id: int, video: bool = False) -> Track | None:
         try:
-            searcher = VideosSearch(query, limit=1, with_live=False)
-            result = await searcher.next()
-        except Exception:
-            return None
-
-        if result and result["result"]:
-            data = result["result"][0]
+            value = self._normalize_query(query)
+            info = await asyncio.to_thread(
+                self._extract_info, value, self._base_options()
+            )
+            if not info:
+                return None
+            duration = int(info.get("duration") or 0)
+            duration_text = utils.format_eta(duration) if hasattr(utils, "format_eta") else (
+                f"{duration // 60}:{duration % 60:02d}" if duration else "00:00"
+            )
+            webpage_url = info.get("webpage_url") or info.get("original_url")
+            video_id = info.get("id")
+            if not video_id and webpage_url:
+                query_params = parse_qs(urlparse(webpage_url).query)
+                video_id = (query_params.get("v") or [""])[0]
+            if not video_id:
+                return None
             return Track(
-                id=data.get("id"),
-                channel_name=data.get("channel", {}).get("name"),
-                duration=data.get("duration"),
-                duration_sec=utils.to_seconds(data.get("duration")),
+                id=str(video_id),
+                channel_name=str(info.get("channel") or info.get("uploader") or "YouTube"),
+                duration=duration_text,
+                duration_sec=duration,
                 message_id=msg_id,
-                title=data.get("title")[:25],
-                thumbnail=data.get("thumbnails", [{}])[-1].get("url").split("?")[0],
-                url=data.get("link"),
-                view_count=data.get("viewCount", {}).get("short"),
+                title=str(info.get("title") or "Unknown title")[:25],
+                thumbnail=str(info.get("thumbnail") or "").split("?")[0] or None,
+                url=str(webpage_url or f"{self.watch_url}{video_id}"),
+                view_count=self._format_view_count(info.get("view_count")),
                 video=video,
             )
+        except Exception as exc:
+            logger.warning("YouTube search/resolve failed (%s)", type(exc).__name__)
+            return None
 
-        return None
-
-    async def playlist(
-        self,
-        limit: int,
-        user: str,
-        url: str,
-        video: bool,
-    ) -> list[Track | None]:
-        playlist_tracks = []
-
+    @staticmethod
+    def _format_view_count(value) -> str:
         try:
-            playlist_data = await Playlist.get(url)
-            for item in playlist_data["videos"][:limit]:
-                playlist_tracks.append(
-                    Track(
-                        id=item.get("id"),
-                        channel_name=item.get("channel", {}).get("name", ""),
-                        duration=item.get("duration"),
-                        duration_sec=utils.to_seconds(item.get("duration")),
-                        title=item.get("title")[:25],
-                        thumbnail=item.get("thumbnails")[-1]
-                        .get("url")
-                        .split("?")[0],
-                        url=item.get("link").split("&list=")[0],
-                        user=user,
-                        view_count="",
-                        video=video,
-                    )
-                )
-        except Exception:
-            pass
+            count = int(value or 0)
+        except (TypeError, ValueError):
+            return ""
+        if count >= 1_000_000_000:
+            return f"{count / 1_000_000_000:.1f}B views"
+        if count >= 1_000_000:
+            return f"{count / 1_000_000:.1f}M views"
+        if count >= 1_000:
+            return f"{count / 1_000:.1f}K views"
+        return f"{count:,} views" if count else ""
 
-        return playlist_tracks
+    @staticmethod
+    def _extract_playlist(query: str, limit: int, options: dict) -> list[dict]:
+        options = {
+            **options,
+            "noplaylist": False,
+            "extract_flat": "in_playlist",
+            "ignoreerrors": True,
+            "playlistend": limit,
+            "skip_download": True,
+        }
+        with yt_dlp.YoutubeDL(options) as ydl:
+            result = ydl.extract_info(query, download=False)
+        return [item for item in ((result or {}).get("entries") or [])[:limit] if item]
+
+    async def playlist(self, limit: int, user: str, url: str, video: bool) -> list[Track | None]:
+        try:
+            value = self._normalize_query(url)
+            entries = await asyncio.to_thread(
+                self._extract_playlist, value, max(1, int(limit)), self._base_options(playlist=True)
+            )
+            tracks = []
+            for item in entries:
+                video_id = str(item.get("id") or "").strip()
+                if not video_id:
+                    candidate = str(item.get("url") or item.get("webpage_url") or "")
+                    video_id = candidate.rsplit("v=", 1)[-1].split("&", 1)[0]
+                if not video_id:
+                    continue
+                duration = int(item.get("duration") or 0)
+                tracks.append(Track(
+                    id=video_id,
+                    channel_name=str(item.get("channel") or item.get("uploader") or ""),
+                    duration=(f"{duration // 60}:{duration % 60:02d}" if duration else "00:00"),
+                    duration_sec=duration,
+                    title=str(item.get("title") or "Unknown title")[:25],
+                    thumbnail=str(item.get("thumbnail") or "").split("?")[0] or None,
+                    url=str(item.get("webpage_url") or f"{self.watch_url}{video_id}"),
+                    user=user,
+                    view_count=self._format_view_count(item.get("view_count")),
+                    video=video,
+                ))
+            return tracks
+        except Exception as exc:
+            logger.warning("YouTube playlist extraction failed (%s)", type(exc).__name__)
+            return []
+
+    def _download_sync(self, video_id: str, video: bool, cookie_file: str | None) -> str:
+        url = self.watch_url + video_id
+        template = str(self.download_dir / "%(id)s.%(ext)s")
+        if video:
+            selector = "(bestvideo[height<=?720][width<=?1280])+(bestaudio)/best[height<=?720]"
+        else:
+            selector = "bestaudio/best"
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "format": selector,
+            "outtmpl": template,
+            "restrictfilenames": True,
+            "socket_timeout": 30,
+            "retries": 3,
+            "fragment_retries": 3,
+            "overwrites": False,
+        }
+        if video:
+            options["merge_output_format"] = "mp4"
+        if cookie_file and Path(cookie_file).is_file():
+            options["cookiefile"] = cookie_file
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+            prepared = Path(ydl.prepare_filename(info))
+            if prepared.is_file():
+                return str(prepared)
+        candidates = sorted(self.download_dir.glob(f"{video_id}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            return str(candidates[0])
+        raise FileNotFoundError(f"yt-dlp did not produce a media file for {video_id}")
 
     async def download(self, video_id: str, video: bool = False) -> str | None:
-        url = self.watch_url + video_id
-        extension = "mp4" if video else "webm"
-        output_file = f"downloads/{video_id}.{extension}"
-
-        if Path(output_file).exists():
-            return output_file
-
+        video_id = str(video_id or "").strip()
+        if not video_id:
+            return None
+        candidates = list(self.download_dir.glob(f"{video_id}.*"))
+        if candidates:
+            return str(max(candidates, key=lambda p: p.stat().st_mtime))
         cookie_file = self.load_cookies()
-
-        common_options = {
-            "outtmpl": "downloads/%(id)s.%(ext)s",
-            "quiet": True,
-            "noplaylist": True,
-            "geo_bypass": True,
-            "no_warnings": True,
-            "overwrites": False,
-            "nocheckcertificate": True,
-            "cookiefile": cookie_file,
-        }
-
-        if video:
-            ydl_options = {
-                **common_options,
-                "format": "(bestvideo[height<=?720][width<=?1280][ext=mp4])+(bestaudio)",
-                "merge_output_format": "mp4",
-            }
-        else:
-            ydl_options = {
-                **common_options,
-                "format": "bestaudio[ext=webm][acodec=opus]",
-            }
-
-        def _run_download():
-            with yt_dlp.YoutubeDL(ydl_options) as ydl:
-                try:
-                    ydl.download([url])
-                except (yt_dlp.utils.DownloadError, yt_dlp.utils.ExtractorError):
-                    return None
-                except Exception as exc:
-                    logger.warning("Download failed: %s", exc)
-                    return None
-            return output_file
-
-        return await asyncio.to_thread(_run_download)
+        try:
+            return await asyncio.to_thread(self._download_sync, video_id, video, cookie_file)
+        except Exception as exc:
+            logger.exception("YouTube media download failed for %s (%s)", video_id, type(exc).__name__)
+            return None
