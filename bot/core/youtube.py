@@ -37,7 +37,7 @@ class YouTube:
         self.invalid_pattern = re.compile(
             r"^https?://(?:(?:www|m|music)\.)?(?:youtube\.com|youtu\.be)"
             r"(?!/(?:watch\?v=[A-Za-z0-9_-]{11}|shorts/[A-Za-z0-9_-]{11}"
-            r"|playlist\?list=PL[A-Za-z0-9_-]+|[A-Za-z0-9_-]{11}))\\S*",
+            r"|playlist\?list=PL[A-Za-z0-9_-]+|[A-Za-z0-9_-]{11}))\S*",
             re.IGNORECASE,
         )
 
